@@ -1,4 +1,5 @@
 import math
+import random
 import torch
 import numpy as np
 from monai.config import KeysCollection
@@ -14,32 +15,40 @@ class GaussianNoiseTumourCT(MapTransform):
     BraTSの GaussianNoiseTumour との主な相違点:
         - CSVの事前計算済みバウンディングボックス情報が不要 (ラベルから動的算出)
         - 出力キー名が scan_ct_* に統一
-        - 強度正規化はクロップ後のミンマックス [-1, 1] (元コードと同方式)
-          入力CTが [0, 1] 正規化済みであることを前提とし、HUウィンドウ処理は行わない
+        - rescale_patch=True（既定）のとき、クロップ後・ノイズ後にミンマックス [0, 1]。
+          rescale_patch=False のときは正規化なし：クロップ強度はそのまま、
+          ノイズ後は clip [0,1] のみ（min-max はしない）。
+          入力CTが [0, 1] 正規化済みであることを前提とし、HUウィンドウ処理は行わない。
 
     入力キー: scan_ct (CT画像, shape: [C, H, W, D], 値域: [0, 1])
               label    (腫瘍マスク, shape: [C, H, W, D], 値: 0 or 1)
 
     出力キー (d に追加):
-        scan_ct_crop      : 腫瘍周囲をクロップした正規化済みCT
-        scan_ct_crop_pad  : patch_size^3にパディングしたクロップCT [-1, 1]
-        scan_ct_noisy     : 腫瘍領域にガウシアンノイズを付加したもの [-1, 1]
+        scan_ct_crop      : 腫瘍周囲クロップ（rescale_patch で min-max 有無が変わる）
+        scan_ct_crop_pad  : patch_size^3パディング（パディング値 0）
+        scan_ct_noisy     : 腫瘍内ノイズ後（rescale_patch: min-max [0,1]、else: clip [0,1]）
         label_crop_pad    : patch_size^3にパディングしたクロップラベル
         label_crop        : クロップラベル（パディングなし）
 
     Args:
         keys (KeysCollection): CT画像のキー名（例: "scan_ct"）
         patch_size (int): クロップ後のパッチサイズ (default: 96)
+        rescale_patch (bool): True（既定）ならパッチ内 min-max 正規化を行う。False なら行わない。
+        noise_type (str): "gaussian_tumour" or "gaussian_extended"
     """
 
     def __init__(
         self,
         keys: KeysCollection,
         patch_size: int = 96,
+        rescale_patch: bool = True,
+        noise_type: str = "gaussian_tumour",
     ):
         super().__init__(keys)
         self.keys = keys
         self.patch_size = patch_size
+        self.rescale_patch = rescale_patch
+        self.noise_type = noise_type
 
     def __call__(self, data):
         d = dict(data)
@@ -113,23 +122,44 @@ class GaussianNoiseTumourCT(MapTransform):
             z_top = max_z
 
         # ── クロップ ──────────────────────────────────────────────────────
-        # 元コードと同様: クロップ後にミンマックス [-1, 1] 正規化
         scan_ct_crop = scan_ct[:, x_base:x_top, y_base:y_top, z_base:z_top]
-        scan_ct_crop = self._rescale_array_tensor(scan_ct_crop, minv=-1, maxv=1)
+        if self.rescale_patch:
+            scan_ct_crop = self._rescale_array_tensor(scan_ct_crop, minv=0, maxv=1)
+        scan_ct_crop = np.asarray(scan_ct_crop, dtype=np.float32)
         label_crop   = label_np[:, x_base:x_top, y_base:y_top, z_base:z_top]
 
-        # ── パディング (境界値: scan=-1, label=0) ───────────────────────────
+        # ── パディング (境界値: scan=0, label=0) ───────────────────────────
         pw = ((0, 0), (x_base_pad, x_top_pad), (y_base_pad, y_top_pad), (z_base_pad, z_top_pad))
-        scan_ct_crop_pad = np.pad(scan_ct_crop, pad_width=pw, mode="constant", constant_values=(-1, -1))
+        scan_ct_crop_pad = np.pad(scan_ct_crop, pad_width=pw, mode="constant", constant_values=(0, 0))
         label_crop_pad   = np.pad(label_crop,   pad_width=pw, mode="constant", constant_values=(0,  0))
+        valid_mask = np.pad(
+            np.ones_like(label_crop, dtype=bool),
+            pad_width=pw,
+            mode="constant",
+            constant_values=(False, False),
+        )
 
         # ── 腫瘍領域へのガウシアンノイズ付加 ────────────────────────────────
         max_size = max(x_size, y_size, z_size)
         exp_base = self._norm_exp_base(max_size)
-        scan_ct_noisy = self._add_gaussian_noise_tumour(
-            scan=scan_ct_crop_pad, label=label_crop_pad, exp_base=exp_base
-        )
-        scan_ct_noisy = self._rescale_array_numpy(scan_ct_noisy, minv=-1, maxv=1)
+        if self.noise_type == "gaussian_extended":
+            scan_ct_noisy = self._add_gaussian_noise_extended(
+                scan=scan_ct_crop_pad,
+                label=label_crop_pad,
+                exp_base=exp_base,
+                valid_mask=valid_mask,
+            )
+        else:
+            scan_ct_noisy = self._add_gaussian_noise_tumour(
+                scan=scan_ct_crop_pad,
+                label=label_crop_pad,
+                exp_base=exp_base,
+                valid_mask=valid_mask,
+            )
+        if self.rescale_patch:
+            scan_ct_noisy = self._rescale_array_numpy(scan_ct_noisy, minv=0, maxv=1)
+        else:
+            scan_ct_noisy = np.clip(scan_ct_noisy, 0.0, 1.0)
 
         # ── データ辞書に格納 ──────────────────────────────────────────────
         d[self.keys]          = scan_ct  # 元スキャンをそのまま保持
@@ -165,8 +195,13 @@ class GaussianNoiseTumourCT(MapTransform):
         c = 1.1 - 96 * m
         return m * value + c
 
+    def _distance_3d(self, point1, point2):
+        x1, y1, z1 = point1
+        x2, y2, z2 = point2
+        return math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2 + (z2 - z1) ** 2)
+
     def _add_gaussian_noise_tumour(
-        self, scan: np.ndarray, label: np.ndarray, exp_base: float
+        self, scan: np.ndarray, label: np.ndarray, exp_base: float, valid_mask: np.ndarray
     ) -> np.ndarray:
         """腫瘍マスク内のボクセルにガウシアンノイズを付加する"""
         P = self.patch_size
@@ -179,9 +214,38 @@ class GaussianNoiseTumourCT(MapTransform):
                     if np.any(label[:, x, y, z] > 0):
                         noise[0, x, y, z] = float(torch.randn(1))
 
+        # 腫瘍マスク内のみノイズを上書き（パディング0と背景0の混同を避ける）
+        tumour = np.logical_and(np.any(label > 0, axis=0), np.any(valid_mask, axis=0))
         np.copyto(
             scan_noisy,
             noise,
-            where=np.logical_and(noise < 100, scan_noisy != -1),
+            where=np.logical_and(noise < 100, tumour),
         )
+        return scan_noisy
+
+    def _add_gaussian_noise_extended(
+        self, scan: np.ndarray, label: np.ndarray, exp_base: float, valid_mask: np.ndarray
+    ) -> np.ndarray:
+        """腫瘍内は必ずノイズ、周辺は中心からの確率でノイズを付加"""
+        P = self.patch_size
+        scan_noisy = np.copy(scan)
+        noise = np.full((1, P, P, P), 1000.0, dtype=np.float32)
+        centre = (P // 2, P // 2, P // 2)
+        tumour = np.any(label > 0, axis=0)
+        valid = np.any(valid_mask, axis=0)
+
+        for x in range(P):
+            for y in range(P):
+                for z in range(P):
+                    if not valid[x, y, z]:
+                        continue
+                    if tumour[x, y, z]:
+                        noise[0, x, y, z] = float(torch.randn(1))
+                    else:
+                        distance = self._distance_3d(centre, (x + 1, y + 1, z + 1))
+                        prob = 83 / (exp_base**distance + 82)
+                        if random.random() <= prob:
+                            noise[0, x, y, z] = float(torch.randn(1))
+
+        np.copyto(scan_noisy, noise, where=np.logical_and(noise < 100, valid))
         return scan_noisy

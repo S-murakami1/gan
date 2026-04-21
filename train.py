@@ -16,7 +16,6 @@ import sys
 sys.path.append("./")
 sys.path.append("../")
 sys.path.append("../../")
-from utils.data_utils import get_loader
 from discriminator import Discriminator
 
 def save_ckp(state, checkpoint_dir):
@@ -236,7 +235,7 @@ def train(args, global_step, train_loader, generator, G_optimizer, recon_loss, w
             ########### Fake ###########
             # Discriminator's input FAKE
             input_noise = torch.cat([x_crop_noisy, y_crop_pad], dim=1) 
-            scan_recon = generator(input_noise) # Recontruction using the Generator
+            scan_recon = torch.clamp(generator(input_noise), 0.0, 1.0)
             input_fake = torch.cat([scan_recon, y_crop_pad], dim=1)
             
             if args.not_abs_value_loss=="True":
@@ -272,7 +271,7 @@ def train(args, global_step, train_loader, generator, G_optimizer, recon_loss, w
 
             # Compute L1 loss
             input_noise = torch.cat([x_crop_noisy, y_crop_pad], dim=1) 
-            scan_recon = generator(input_noise) # Recontruction using the Generator
+            scan_recon = torch.clamp(generator(input_noise), 0.0, 1.0)
             loss_recons = recon_loss(scan_recon, x_crop_pad)
             
             input_fake = torch.cat([scan_recon, y_crop_pad], dim=1)
@@ -323,7 +322,7 @@ def __main__():
     parser.add_argument("--logdir", default="test", type=str, help="Directory to save the experiment")
     parser.add_argument("--batch_size", default=2, type=int, help="Batch size")
     parser.add_argument("--num_workers", default=2, type=int, help="Number of workers for the data loader. Choose a value less than or equal to the number of CPU cores.")
-    parser.add_argument("--in_channels", default=4, type=int, help="Number of input channels (Default 4 -> 3 channel label + 1 channel scan with noise)")
+    parser.add_argument("--in_channels", default=2, type=int, help="Number of input channels (CT fixed: noisy scan 1ch + label 1ch)")
     parser.add_argument("--out_channels", default=1, type=int, help="Number of output channels (Default 1 -> Scan with reconstructed tumour)")
     parser.add_argument("--feature_size", default=48, type=int, help="Feature size")
     parser.add_argument("--use_checkpoint", action="store_true", help="Use gradient checkpointing to save memory")
@@ -341,11 +340,15 @@ def __main__():
     parser.add_argument("--generator_type", default="SwinUNETR", type=str, help="Generator type: SwinUNETR, AttentionUnetm Unet")
     parser.add_argument("--w_loss_recons", default=1, type=int, help="Reconstruction Loss Component Weight") 
     parser.add_argument("--l1_w_progressing", default="False", type=str, help="If progressively want to increase the weight of L1 loss in the loss function. Activates the second step of training to remove the noise around of the visible volume.")
-    parser.add_argument("--modality", default="t1ce", type=str, help="What modality to train: t1, t2, t1ce, flair, ct")
-    parser.add_argument("--csv_path", default="", type=str, help="Path to the CSV with all cases to use when training (BraTS only)")
-    parser.add_argument("--dataset", type=str, help="Dataset identifier. BraTS: BRATS_2023 etc. CT: CT")
     parser.add_argument("--data_root", default="", type=str, help="Root directory of the CT dataset (nifti/default_spacing)")
     parser.add_argument("--json_path", default="", type=str, help="Path to train_val.json for CT dataset (empty = auto-detect under data_root)")
+    parser.add_argument(
+        "--no_ct_rescale_patch",
+        dest="ct_rescale_patch",
+        action="store_false",
+        default=True,
+        help="Disable per-patch min-max to [0,1] after crop and after noise (default: normalization ON).",
+    )
     parser.add_argument("--checkpoint_dir", default="", type=str, help="Base directory to save checkpoints (default: Checkpoint/ in current directory)")
     args = parser.parse_args()
 
@@ -358,20 +361,12 @@ def __main__():
     print(f"The Generator is updated {args.G_n_update} times and the Discriminator {args.D_n_update} times per iteration")
     print(f"Reconstruction Loss Component Weight: {args.w_loss_recons}")
 
-    if args.dataset.lower() == "ct":
-        args.dataset = "CT"
-        args.modality = "ct"
-        args.scan_name = "scan_ct"
-    elif ("2024" in args.dataset.lower()) and ("goat" in args.dataset.lower()) and ("brats" in args.dataset.lower()):
-        args.dataset = "BRATS_GOAT_2024"
-    elif ("brats" in  args.dataset.lower()) and ("2024" in  args.dataset.lower()) and ("goat" not in  args.dataset.lower()) and ("meningioma" not in  args.dataset.lower()):
-        args.dataset = "BRATS_2024"
-    elif ("brats" in  args.dataset.lower()) and ("2023" in  args.dataset.lower()) and ("goat" not in  args.dataset.lower()) and ("meningioma" not in  args.dataset.lower()):
-        args.dataset = "BRATS_2023"
-    elif  ("brats" in  args.dataset.lower()) and ("meningioma" in  args.dataset.lower()):
-        args.dataset = "BRATS_2024_MENINGIOMA"
-    else:
-        raise ValueError("The dataset must be CT or from BraTS: BRATS_GOAT_2024, BRATS_2024, BRATS_2023, BRATS_2024_MENINGIOMA")
+    # CT-only fixed configuration.
+    args.dataset = "CT"
+    args.modality = "ct"
+    args.scan_name = "scan_ct"
+    # CT loader uses noisy scan (1ch) + label (1ch)
+    args.in_channels = 2
 
     create_dirs(args, HOME_DIR=HOME_DIR)
     
@@ -401,11 +396,8 @@ def __main__():
         criterion = torch.nn.BCELoss()
 
     ###### Get train loader ######
-    if args.dataset == "CT":
-        from utils.data_utils_ct import get_ct_loader
-        train_loader = get_ct_loader(args=args)
-    else:
-        train_loader = get_loader(args=args)
+    from utils.data_utils_ct import get_ct_loader
+    train_loader = get_ct_loader(args=args)
 
     # Saving losses (in txt files) to build the plots later
     dic_loss = {}  
@@ -447,7 +439,7 @@ def __main__():
         # Saving a reconstruction and respective groundtruth per epoch 
         save_sample(args=args, image=x_crop_pad[0], reality="x_crop_pad", iter_num=epoch, path=HOME_DIR)
         save_sample(args=args, image=y_crop_pad[0], reality="y_crop_pad", iter_num=epoch, path=HOME_DIR, label=True)
-        save_sample(args=args, image=x_crop_noisy[0], reality="scan_t1ce_noisy", iter_num=epoch, path=HOME_DIR)
+        save_sample(args=args, image=x_crop_noisy[0], reality="scan_ct_noisy", iter_num=epoch, path=HOME_DIR)
         save_sample(args=args, image=scan_recon[0], reality="scan_recon", iter_num=epoch, path=HOME_DIR)
 
         # Adding losses to respective dict

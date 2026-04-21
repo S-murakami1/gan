@@ -35,7 +35,7 @@ def get_ct_loader(args):
         args.json_path   (str)  : train_val.jsonのパス (空文字のとき data_root 直下を自動検索)
         args.batch_size  (int)  : バッチサイズ (Generator + Discriminator 分として 2倍で DataLoader に渡す)
         args.num_workers (int)  : DataLoader のワーカー数
-        args.noise_type  (str)  : "gaussian_tumour" のみ対応 (将来拡張用)
+        args.noise_type  (str)  : "gaussian_tumour" or "gaussian_extended"
         args.patch_size  (int)  : クロップパッチサイズ (default:  96)
         args.cache_rate  (float): CacheDataset のキャッシュ割合 (default: 1.0)
         args.split       (str)  : "training" or "validation" (default: "training")
@@ -43,8 +43,8 @@ def get_ct_loader(args):
     Returns:
         DataLoader: (batch_size*2) で iterate される DataLoader
             各バッチに含まれるキー（学習に必要な3キーのみキャッシュ）:
-                "scan_ct_crop_pad" : 腫瘍周囲96^3クロップ+パディング [-1, 1]
-                "scan_ct_noisy"    : ノイズ付加済み96^3パッチ [-1, 1]
+                "scan_ct_crop_pad" : 腫瘍周囲96^3クロップ+パディング（既定 [0,1] 前提）
+                "scan_ct_noisy"    : ノイズ付加済み96^3パッチ（clip 後 [0,1]）
                 "label_crop_pad"   : 腫瘍周囲96^3クロップ+パディング (0/1)
             ※ 元スキャン全体 (scan_ct, label) はキャッシュ前に削除する。
               これにより推定メモリ使用量: 247 GB → 約 5.4 GB (545症例)
@@ -53,6 +53,10 @@ def get_ct_loader(args):
     SPLIT = getattr(args, "split", "training")
     PATCH_SIZE = int(getattr(args, "patch_size", 96))
     CACHE_RATE = float(getattr(args, "cache_rate", 1.0))
+    CT_RESCALE_PATCH = bool(getattr(args, "ct_rescale_patch", True))
+    NOISE_TYPE = getattr(args, "noise_type", "gaussian_tumour")
+    if NOISE_TYPE not in ("gaussian_tumour", "gaussian_extended"):
+        raise ValueError("CT noise_type must be one of: gaussian_tumour, gaussian_extended")
 
     # ── JSON パスの解決 ───────────────────────────────────────────────────
     data_root = args.data_root
@@ -63,6 +67,8 @@ def get_ct_loader(args):
     print(f"DATA_ROOT  : {data_root}")
     print(f"SPLIT      : {SPLIT}")
     print(f"PATCH_SIZE : {PATCH_SIZE}")
+    print(f"CT_RESCALE_PATCH (min-max in crop) : {CT_RESCALE_PATCH}")
+    print(f"NOISE_TYPE : {NOISE_TYPE}")
 
     # ── ファイルリストの読み込み ──────────────────────────────────────────
     data_list = load_decathlon_datalist(
@@ -86,6 +92,8 @@ def get_ct_loader(args):
             GaussianNoiseTumourCT(
                 keys="scan_ct",
                 patch_size=PATCH_SIZE,
+                rescale_patch=CT_RESCALE_PATCH,
+                noise_type=NOISE_TYPE,
             ),
             # 学習に不要な元スキャン全体（232MB/症例）をキャッシュ前に削除し
             # メモリ使用量を 247GB → 約5GB に削減する
